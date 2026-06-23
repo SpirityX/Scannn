@@ -1,0 +1,600 @@
+/**
+ * SpiderScann v3.0 — Backend Node.js + IA GPT-4o
+ * by Anony'x | WhatsApp: +226 03 99 64 69
+ * IA intégrée sur TOUTES les fonctionnalités
+ */
+
+const express    = require('express');
+const cors       = require('cors');
+const dns        = require('dns').promises;
+const net        = require('net');
+const https      = require('https');
+const http       = require('http');
+const path       = require('path');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
+
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+const fetchFn = (...a) => import('node-fetch').then(({default:f}) => f(...a));
+
+// ══════════════════════════════════════
+//  UTILITAIRES RÉSEAU
+// ══════════════════════════════════════
+
+function checkHost(host, proto='https', timeout=5000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const mod   = proto === 'https' ? https : http;
+    const req   = mod.get(`${proto}://${host}`, {timeout}, (res) => {
+      const ms = Date.now()-start;
+      res.destroy();
+      resolve({ok:true, status:res.statusCode, ms, url:`${proto}://${host}`});
+    });
+    req.on('error', ()  => resolve({ok:false, status:null,      ms:Date.now()-start, url:`${proto}://${host}`}));
+    req.on('timeout',() => { req.destroy(); resolve({ok:false, status:'timeout', ms:timeout, url:`${proto}://${host}`}); });
+  });
+}
+
+function probePort(host, port, timeout=2000) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (open) => { if(!done){done=true;socket.destroy();resolve(open);} };
+    socket.setTimeout(timeout);
+    socket.connect(port, host, () => finish(true));
+    socket.on('error',   () => finish(false));
+    socket.on('timeout', () => finish(false));
+  });
+}
+
+async function dnsLookup(hostname, type) {
+  try {
+    let records = [];
+    switch(type) {
+      case 'A':     records = await dns.resolve4(hostname, {ttl:true}); break;
+      case 'AAAA':  records = await dns.resolve6(hostname, {ttl:true}); break;
+      case 'MX':    records = await dns.resolveMx(hostname); break;
+      case 'TXT':   records = await dns.resolveTxt(hostname); break;
+      case 'NS':    records = await dns.resolveNs(hostname); break;
+      case 'CNAME': records = await dns.resolveCname(hostname); break;
+      case 'SOA':   records = [await dns.resolveSoa(hostname)]; break;
+      default:      records = await dns.resolve(hostname);
+    }
+    return {ok:true, type, records};
+  } catch(e) { return {ok:false, type, error:e.message}; }
+}
+
+function pingHost(host, timeout=3000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const req = https.get(`https://${host}`, {timeout}, (res) => {
+      res.destroy(); resolve({ok:true, ms:Date.now()-start});
+    });
+    req.on('error',   () => resolve({ok:false, ms:Date.now()-start}));
+    req.on('timeout', () => { req.destroy(); resolve({ok:false, ms:timeout}); });
+  });
+}
+
+// ══════════════════════════════════════
+//  IA — GPT-4o CORE
+// ══════════════════════════════════════
+
+const SYS_PROMPT = `Tu es SpiderScann AI, un expert senior en cybersécurité, diagnostic réseau et administration système.
+Tu analyses des données réseau et fournis:
+- Des explications claires et pédagogiques
+- Des évaluations de risque précises
+- Des recommandations concrètes et actionnables
+- Des scores de sécurité avec justification
+- Des conseils proactifs même sans problème détecté
+
+Réponds TOUJOURS en français, structuré avec des sections.
+Utilise ces emojis pour les niveaux: ✅ OK | ⚠️ Attention | 🔴 Critique | 🔵 Info | 💡 Conseil | 🛡️ Sécurité | 🚀 Performance`;
+
+async function gpt(userContent, extraSystem='') {
+  if (!OPENAI_KEY) {
+    return {
+      ok: false,
+      error: '🔑 Clé OpenAI non configurée.\nAjoutez OPENAI_API_KEY dans vos variables d\'environnement Render.\nDashboard Render → Environment → Add Variable'
+    };
+  }
+  try {
+    const res = await fetchFn('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', 'Authorization':`Bearer ${OPENAI_KEY}`},
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        max_tokens: 1500,
+        temperature: 0.3,
+        messages: [
+          {role:'system', content: SYS_PROMPT + (extraSystem ? '\n' + extraSystem : '')},
+          {role:'user',   content: userContent}
+        ]
+      })
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      return {ok:false, error:`Erreur OpenAI: ${err.error?.message || res.status}`};
+    }
+    const data = await res.json();
+    return {ok:true, analysis: data.choices[0].message.content};
+  } catch(e) {
+    return {ok:false, error:`Erreur réseau: ${e.message}`};
+  }
+}
+
+// ══════════════════════════════════════
+//  ROUTES API — RÉSEAU
+// ══════════════════════════════════════
+
+app.get('/api/health', (req, res) => {
+  res.json({status:'ok', version:'3.0.0', author:"Anony'x", ai: !!OPENAI_KEY, uptime: process.uptime()});
+});
+
+app.post('/api/hosts', async (req, res) => {
+  const {hosts=[], proto='https'} = req.body;
+  if (!hosts.length) return res.status(400).json({error:'Aucun host fourni.'});
+  const tasks = [];
+  for (const host of hosts.slice(0,100)) {
+    const protos = proto === 'both' ? ['https','http'] : [proto];
+    for (const p of protos)
+      tasks.push(checkHost(host.trim(), p).then(r => ({host:host.trim(), proto:p, ...r})));
+  }
+  res.json({results: await Promise.all(tasks)});
+});
+
+app.post('/api/ports', async (req, res) => {
+  const {host, ports=[]} = req.body;
+  if (!host) return res.status(400).json({error:'Host manquant.'});
+  const limited = ports.slice(0, 500);
+  const results = [];
+  for (let i=0; i<limited.length; i+=20) {
+    const batch = await Promise.all(
+      limited.slice(i,i+20).map(async port => ({port, open: await probePort(host, port)}))
+    );
+    results.push(...batch);
+  }
+  res.json({host, results});
+});
+
+app.get('/api/dns', async (req, res) => {
+  const {host, type='A'} = req.query;
+  if (!host) return res.status(400).json({error:'Host manquant.'});
+  const types   = type==='ALL' ? ['A','AAAA','MX','TXT','NS','CNAME','SOA'] : [type.toUpperCase()];
+  const results = await Promise.all(types.map(t => dnsLookup(host, t)));
+  res.json({host, results});
+});
+
+app.get('/api/ping', async (req, res) => {
+  const {host, count=10} = req.query;
+  if (!host) return res.status(400).json({error:'Host manquant.'});
+  const n = Math.min(parseInt(count)||10, 50);
+  const times = [];
+  for (let i=0; i<n; i++) {
+    const r = await pingHost(host);
+    times.push({seq:i+1, ...r});
+    if (i<n-1) await new Promise(r=>setTimeout(r,300));
+  }
+  const ok = times.filter(t=>t.ok).map(t=>t.ms);
+  const stats = ok.length
+    ? {min:Math.min(...ok), max:Math.max(...ok), avg:Math.round(ok.reduce((a,b)=>a+b,0)/ok.length), loss:Math.round(((n-ok.length)/n)*100)}
+    : {min:0, max:0, avg:0, loss:100};
+  res.json({host, count:n, times, stats});
+});
+
+app.get('/api/geoip', async (req, res) => {
+  const {ip=''} = req.query;
+  try {
+    const r    = await fetchFn(ip ? `https://ipapi.co/${ip}/json/` : 'https://ipapi.co/json/');
+    const data = await r.json();
+    res.json({ok:true, data});
+  } catch(e) { res.json({ok:false, error:e.message}); }
+});
+
+app.get('/api/ssl', async (req, res) => {
+  const {host} = req.query;
+  if (!host) return res.status(400).json({error:'Host manquant.'});
+  let httpsOk=false, ms=0, cert=null;
+  try { const t0=Date.now(); await fetchFn(`https://${host}`,{timeout:5000}); ms=Date.now()-t0; httpsOk=true; } catch {}
+  try {
+    const r     = await fetchFn(`https://crt.sh/?q=${encodeURIComponent(host)}&output=json`);
+    const certs = await r.json();
+    if (certs?.length) cert = certs.sort((a,b)=>new Date(b.not_before)-new Date(a.not_before))[0];
+  } catch {}
+  res.json({host, httpsOk, ms, cert});
+});
+
+app.get('/api/whois', async (req, res) => {
+  const {host} = req.query;
+  if (!host) return res.status(400).json({error:'Host manquant.'});
+  try {
+    const r    = await fetchFn(`https://rdap.org/domain/${encodeURIComponent(host)}`);
+    const data = await r.json();
+    res.json({ok:true, data});
+  } catch(e) { res.json({ok:false, error:e.message}); }
+});
+
+// Blacklist check via DNS
+app.get('/api/blacklist', async (req, res) => {
+  const {ip} = req.query;
+  if (!ip) return res.status(400).json({error:'IP manquante.'});
+  const parts   = ip.split('.').reverse().join('.');
+  const dnsbls  = [
+    {name:'Spamhaus ZEN',    zone:`${parts}.zen.spamhaus.org`},
+    {name:'Barracuda',       zone:`${parts}.b.barracudacentral.org`},
+    {name:'SORBS',           zone:`${parts}.dnsbl.sorbs.net`},
+    {name:'SpamCop',         zone:`${parts}.bl.spamcop.net`},
+    {name:'CBL Abuseat',     zone:`${parts}.cbl.abuseat.org`},
+    {name:'SpamRATS All',    zone:`${parts}.all.spamrats.com`},
+    {name:'Truncate',        zone:`${parts}.truncate.gbudb.net`},
+    {name:'PSBL',            zone:`${parts}.psbl.surriel.com`},
+  ];
+  const results = await Promise.all(dnsbls.map(async bl => {
+    try {
+      await dns.resolve4(bl.zone);
+      return {name:bl.name, listed:true};
+    } catch { return {name:bl.name, listed:false}; }
+  }));
+  res.json({ip, results});
+});
+
+// Headers HTTP
+app.get('/api/headers', async (req, res) => {
+  const {host} = req.query;
+  if (!host) return res.status(400).json({error:'Host manquant.'});
+  const url = host.startsWith('http') ? host : `https://${host}`;
+  try {
+    const r = await fetchFn(url, {method:'HEAD', timeout:5000, redirect:'follow'});
+    const headers = {};
+    r.headers.forEach((v,k) => { headers[k] = v; });
+    res.json({ok:true, status:r.status, url:r.url, headers});
+  } catch(e) { res.json({ok:false, error:e.message}); }
+});
+
+// ══════════════════════════════════════
+//  ROUTES IA — ANALYSE COMPLÈTE
+// ══════════════════════════════════════
+
+// IA - Hosts
+app.post('/api/ai/hosts', async (req, res) => {
+  const {results} = req.body;
+  if (!results) return res.status(400).json({error:'Données manquantes.'});
+  const ok   = results.filter(r=>r.ok).length;
+  const down = results.filter(r=>!r.ok).map(r=>`${r.host} (${r.proto})`);
+  const slow = results.filter(r=>r.ok && r.ms>2000).map(r=>`${r.host}: ${r.ms}ms`);
+  res.json(await gpt(`Analyse ces résultats de Host Checker:
+
+📊 STATISTIQUES:
+- Total scanné: ${results.length} hosts
+- En ligne: ${ok} | Hors ligne: ${results.length-ok}
+- Hosts hors ligne: ${down.join(', ') || 'aucun'}
+- Hosts lents (>2s): ${slow.join(', ') || 'aucun'}
+- Détail complet: ${JSON.stringify(results.slice(0,30))}
+
+Fournis une analyse complète:
+1. 📋 Résumé de la situation
+2. 🔴 Services critiques hors ligne (si applicable)
+3. ⚠️ Hosts lents à surveiller
+4. 💡 Recommandations immédiates
+5. 🛡️ Plan d'action priorisé
+6. ✅ Points positifs`));
+});
+
+// IA - Ports
+app.post('/api/ai/ports', async (req, res) => {
+  const {results, host} = req.body;
+  if (!results) return res.status(400).json({error:'Données manquantes.'});
+  const PORT_INFO = {21:'FTP (transfert fichiers non chiffré)',22:'SSH (accès distant sécurisé)',23:'Telnet (DANGER - non chiffré)',25:'SMTP (envoi emails)',53:'DNS',80:'HTTP (web non chiffré)',110:'POP3',143:'IMAP',443:'HTTPS (web chiffré)',445:'SMB (partage fichiers Windows)',3306:'MySQL',3389:'RDP (bureau distant)',5432:'PostgreSQL',6379:'Redis (cache mémoire)',8080:'HTTP alternatif',8443:'HTTPS alternatif',27017:'MongoDB',2375:'Docker API (DANGER - non chiffré)',1433:'MSSQL',6443:'Kubernetes API',9200:'Elasticsearch',11211:'Memcached',5672:'RabbitMQ AMQP',9092:'Kafka'};
+  const open   = results.filter(r=>r.open).map(p=>`Port ${p.port}: ${PORT_INFO[p.port]||'service inconnu'}`);
+  const closed = results.filter(r=>!r.open).map(p=>p.port);
+  const danger = results.filter(r=>r.open && [23,2375,3389,6379,27017,9200,11211].includes(r.port));
+  res.json(await gpt(`Analyse de sécurité Port Scanner pour: ${host}
+
+🔓 PORTS OUVERTS (${open.length}):
+${open.join('\n') || 'Aucun'}
+
+🔒 PORTS FERMÉS: ${closed.join(', ') || 'Aucun'}
+
+⚠️ PORTS DANGEREUX OUVERTS: ${danger.map(p=>`${p.port}`).join(', ') || 'Aucun'}
+
+Total scanné: ${results.length} ports
+
+Fournis:
+1. 🛡️ Score de sécurité global /10 avec justification détaillée
+2. 🔴 Ports critiques à fermer IMMÉDIATEMENT avec raison
+3. ⚠️ Ports à sécuriser ou restreindre
+4. 💡 Configuration firewall recommandée
+5. 🔵 Explication de chaque port ouvert (usage légitime?)
+6. 🚀 Plan de sécurisation étape par étape
+7. ✅ Points positifs de la configuration actuelle`));
+});
+
+// IA - DNS
+app.post('/api/ai/dns', async (req, res) => {
+  const {results, host} = req.body;
+  if (!results) return res.status(400).json({error:'Données manquantes.'});
+  const hasSPF   = results.some(r=>r.ok && r.type==='TXT' && JSON.stringify(r.records).includes('v=spf1'));
+  const hasDMARC = results.some(r=>r.ok && r.type==='TXT' && JSON.stringify(r.records).includes('v=DMARC1'));
+  res.json(await gpt(`Analyse DNS complète pour: ${host}
+
+📋 ENREGISTREMENTS:
+${JSON.stringify(results, null, 2)}
+
+🔐 SÉCURITÉ EMAIL:
+- SPF: ${hasSPF ? '✅ Présent' : '🔴 ABSENT'}
+- DMARC: ${hasDMARC ? '✅ Présent' : '🔴 ABSENT'}
+
+Fournis:
+1. 📋 Résumé de la configuration DNS
+2. 🔐 Analyse sécurité email (SPF/DKIM/DMARC)
+3. ⚠️ Problèmes de configuration détectés
+4. 💡 Recommandations DNS pour améliorer la sécurité
+5. 🛡️ Score DNS /10
+6. 📝 Exemples de configurations SPF/DMARC à ajouter si absents`));
+});
+
+// IA - SSL
+app.post('/api/ai/ssl', async (req, res) => {
+  const {host, httpsOk, ms, cert} = req.body;
+  if (!host) return res.status(400).json({error:'Données manquantes.'});
+  const expiry   = cert?.not_after ? new Date(cert.not_after) : null;
+  const daysLeft = expiry ? Math.round((expiry-new Date())/(1000*60*60*24)) : null;
+  const expired  = daysLeft !== null && daysLeft < 0;
+  const urgent   = daysLeft !== null && daysLeft < 30 && !expired;
+  res.json(await gpt(`Analyse SSL/TLS pour: ${host}
+
+🔒 STATUT: ${httpsOk ? '✅ HTTPS Actif' : '🔴 HTTPS Inactif'}
+⚡ Temps de réponse: ${ms}ms
+📜 Certificat: ${cert ? 'Trouvé' : 'Non trouvé'}
+🏢 Émetteur: ${cert?.issuer_name || '—'}
+📅 Valide depuis: ${cert?.not_before || '—'}
+📅 Expire le: ${cert?.not_after || '—'}
+⏳ Jours restants: ${daysLeft ?? '—'} ${expired ? '🔴 EXPIRÉ!' : urgent ? '⚠️ URGENT!' : ''}
+
+Fournis:
+1. 🛡️ Score SSL/TLS /10
+2. ${expired ? '🔴 ALERTE: Certificat expiré — actions IMMÉDIATES' : urgent ? '⚠️ Renouvellement URGENT (<30j)' : '✅ État du certificat'}
+3. 💡 Recommandations de configuration TLS (protocoles, ciphers)
+4. 🔵 Explication du niveau de chiffrement actuel
+5. 🚀 Comment passer au SSL A+ (Let's Encrypt, HSTS, etc.)
+6. ⚠️ Risques si HTTPS non configuré (SEO, navigateurs, données)`));
+});
+
+// IA - Ping
+app.post('/api/ai/ping', async (req, res) => {
+  const {host, stats, times} = req.body;
+  if (!host || !stats) return res.status(400).json({error:'Données manquantes.'});
+  const jitter = stats.max - stats.min;
+  res.json(await gpt(`Analyse Ping & Latence pour: ${host}
+
+📡 STATISTIQUES:
+- Min: ${stats.min}ms | Max: ${stats.max}ms | Moyenne: ${stats.avg}ms
+- Pertes de paquets: ${stats.loss}%
+- Gigue (jitter): ${jitter}ms
+- Nombre de pings: ${times?.length || 0}
+
+Séquence détaillée: ${JSON.stringify(times?.map(t=>({seq:t.seq,ms:t.ms,ok:t.ok})))}
+
+Fournis:
+1. 📊 Évaluation qualité: Excellente/Bonne/Moyenne/Mauvaise (avec seuils expliqués)
+2. 🔵 Analyse de la stabilité (gigue ${jitter}ms — impact?)
+3. ⚠️ Causes possibles des pertes de paquets (${stats.loss}%)
+4. 🎮 Impact sur les services: Web, VoIP, Gaming, Streaming, VPN
+5. 💡 Solutions pour améliorer la latence et la stabilité
+6. 🛡️ Est-ce un problème de sécurité réseau (filtrage ICMP, etc.)?`));
+});
+
+// IA - WHOIS
+app.post('/api/ai/whois', async (req, res) => {
+  const {host, data} = req.body;
+  if (!host || !data) return res.status(400).json({error:'Données manquantes.'});
+  const events    = data.events || [];
+  const expiry    = events.find(e=>e.eventAction==='expiration');
+  const reg       = events.find(e=>e.eventAction==='registration');
+  const expiryDate = expiry ? new Date(expiry.eventDate) : null;
+  const daysLeft  = expiryDate ? Math.round((expiryDate-new Date())/(1000*60*60*24)) : null;
+  const regEntity = data.entities?.find(e=>e.roles?.includes('registrar'));
+  res.json(await gpt(`Analyse WHOIS pour: ${host}
+
+📋 INFORMATIONS:
+- Domaine: ${data.ldhName || host}
+- Statut: ${(data.status||[]).join(', ')}
+- Registrar: ${regEntity?.vcardArray?.[1]?.find(v=>v[0]==='fn')?.[3] || '—'}
+- Enregistrement: ${reg ? new Date(reg.eventDate).toLocaleDateString('fr-FR') : '—'}
+- Expiration: ${expiryDate?.toLocaleDateString('fr-FR') || '—'} (${daysLeft ?? '—'} jours)
+- DNSSEC: ${data.secureDNS?.delegationSigned ? '✅ Activé' : '⚠️ Désactivé'}
+- Serveurs DNS: ${(data.nameservers||[]).map(n=>n.ldhName).join(', ')||'—'}
+
+Fournis:
+1. 📋 État général du domaine
+2. ${daysLeft !== null && daysLeft < 30 ? '🔴 URGENT: Domaine expire dans ' + daysLeft + ' jours!' : '📅 Calendrier de renouvellement recommandé'}
+3. 🛡️ Analyse DNSSEC et impact sur la sécurité
+4. 💡 Bonnes pratiques pour protéger ce domaine
+5. ⚠️ Risques de typosquatting ou phishing sur ce domaine
+6. 🔵 Signification des statuts (clientTransferProhibited, etc.)`));
+});
+
+// IA - GeoIP
+app.post('/api/ai/geoip', async (req, res) => {
+  const {data} = req.body;
+  if (!data) return res.status(400).json({error:'Données manquantes.'});
+  res.json(await gpt(`Analyse GeoIP complète:
+
+🌍 IP: ${data.ip} (IPv${data.version})
+📍 Localisation: ${data.city}, ${data.region}, ${data.country_name} (${data.country_code})
+🏢 Organisation: ${data.org}
+🔢 ASN: ${data.asn}
+🕐 Timezone: ${data.timezone}
+📡 Réseau: ${data.network}
+
+Fournis:
+1. 🔵 Contexte géographique et réseau
+2. 🏢 Type d'organisation (hébergeur cloud, FAI, datacenter, résidentiel, VPN, Tor?)
+3. 🛡️ Niveau de confiance de cette IP (réputation ASN ${data.asn})
+4. ⚠️ Risques potentiels associés à cette géolocalisation
+5. 💡 Est-ce une IP suspecte? Indicateurs à surveiller
+6. 🔵 Contexte: hébergeurs populaires dans ce pays, réglementation données`));
+});
+
+// IA - Blacklist
+app.post('/api/ai/blacklist', async (req, res) => {
+  const {ip, results} = req.body;
+  if (!ip || !results) return res.status(400).json({error:'Données manquantes.'});
+  const listed = results.filter(r=>r.listed);
+  res.json(await gpt(`Analyse réputation IP: ${ip}
+
+📋 RÉSULTATS BLACKLIST:
+${results.map(r=>`${r.listed?'🔴':'✅'} ${r.name}: ${r.listed?'LISTÉ':'Propre'}`).join('\n')}
+
+📊 Résumé: ${listed.length}/${results.length} listes noires
+
+Fournis:
+1. 🛡️ Score de réputation /10
+2. ${listed.length > 0 ? '🔴 IP BLACKLISTÉE — Conséquences et urgence' : '✅ IP Propre — Que surveiller à l\'avenir'}
+3. 💡 Causes possibles d'une blacklist (spam, malware, abus...)
+4. 🚀 Procédure de délisting étape par étape pour chaque liste concernée
+5. ⚠️ Impact sur la délivrabilité email, réputation web
+6. 🔵 Comment prévenir d'être blacklisté à l'avenir`));
+});
+
+// IA - Headers HTTP
+app.post('/api/ai/headers', async (req, res) => {
+  const {host, status, headers} = req.body;
+  if (!host) return res.status(400).json({error:'Données manquantes.'});
+  const secHeaders = [
+    'strict-transport-security','content-security-policy','x-frame-options',
+    'x-content-type-options','referrer-policy','permissions-policy',
+    'x-xss-protection','cross-origin-opener-policy','cross-origin-embedder-policy'
+  ];
+  const present  = secHeaders.filter(h=>headers?.[h]);
+  const missing  = secHeaders.filter(h=>!headers?.[h]);
+  res.json(await gpt(`Analyse Headers HTTP pour: ${host}
+
+📊 STATUT: HTTP ${status}
+📋 TOUS LES HEADERS: ${JSON.stringify(headers, null, 2)}
+
+🛡️ HEADERS SÉCURITÉ PRÉSENTS (${present.length}): ${present.join(', ')||'Aucun'}
+⚠️ HEADERS SÉCURITÉ MANQUANTS (${missing.length}): ${missing.join(', ')||'Aucun'}
+
+Fournis:
+1. 🛡️ Score sécurité headers /10
+2. 🔴 Headers critiques manquants et leur impact (XSS, clickjacking, MITM...)
+3. ✅ Analyse des headers présents (bien configurés?)
+4. 💡 Configuration exacte recommandée pour chaque header manquant
+5. 🔵 Informations divulguées par les headers (Server, X-Powered-By...)
+6. 🚀 Exemple de configuration Nginx/Apache/Node.js pour sécuriser`));
+});
+
+// IA - CIDR (offline mais analyse IA)
+app.post('/api/ai/cidr', async (req, res) => {
+  const {ip, prefix, network, mask, broadcast, hosts} = req.body;
+  res.json(await gpt(`Analyse réseau CIDR: ${ip}/${prefix}
+
+📋 PARAMÈTRES:
+- Réseau: ${network}/${prefix}
+- Masque: ${mask}
+- Broadcast: ${broadcast}
+- Capacité: ${hosts} hôtes
+
+Fournis:
+1. 🔵 Explication de ce sous-réseau (usage typique de ce range IP)
+2. 🏢 Est-ce un réseau privé (RFC1918) ou public?
+3. 💡 Cas d'usage recommandés pour ce /prefix
+4. 🛡️ Recommandations de segmentation réseau
+5. ⚠️ Risques si ce réseau est mal segmenté
+6. 🔵 Exemples de configuration: routeur, switch, VLAN`));
+});
+
+// IA - Hash analyse
+app.post('/api/ai/hash', async (req, res) => {
+  const {text, sha256, sha512} = req.body;
+  res.json(await gpt(`Analyse cryptographique:
+
+📝 Texte: "${text.substring(0,50)}${text.length>50?'...':''}" (${text.length} caractères)
+🔐 SHA-256: ${sha256}
+🔐 SHA-512: ${sha512}
+
+Fournis:
+1. 🔐 Explication SHA-256 vs SHA-512 (différences, cas d'usage)
+2. 💡 Comment vérifier l'intégrité d'un fichier avec ces hash
+3. ⚠️ SHA-256 est-il suffisant ou faut-il SHA-512?
+4. 🛡️ Bonnes pratiques pour le stockage de mots de passe (bcrypt, argon2...)
+5. 🔵 Différence entre hash, chiffrement et signature numérique
+6. 🔴 Ce que ne fait PAS le hash (irréversible mais pas une protection contre tout)`));
+});
+
+// IA - Analyse encodage
+app.post('/api/ai/encode', async (req, res) => {
+  const {mode, input, output} = req.body;
+  const modeNames = {b64e:'Base64 Encodage',b64d:'Base64 Décodage',urle:'URL Encodage',urld:'URL Décodage',hex:'Hexadécimal Encodage',hexd:'Hexadécimal Décodage'};
+  res.json(await gpt(`Analyse encodage/décodage:
+
+🔄 Mode: ${modeNames[mode] || mode}
+📥 Entrée: "${input.substring(0,100)}"
+📤 Sortie: "${output.substring(0,100)}"
+
+Fournis:
+1. 🔵 Explication de ${modeNames[mode] || mode} et ses cas d'usage
+2. 💡 Où retrouve-t-on cet encodage en pratique (JWT, URLs, HTTP, emails...)
+3. ⚠️ Encodage ≠ Chiffrement: expliquer la différence et les risques
+4. 🛡️ Bonnes pratiques de sécurité liées à cet encodage
+5. 🔴 Attaques possibles (injection, XSS via décodage, etc.)
+6. 🔵 Exemples concrets d'utilisation en développement web`));
+});
+
+// IA - Chat libre
+app.post('/api/ai/chat', async (req, res) => {
+  const {message, history=[]} = req.body;
+  if (!message) return res.status(400).json({error:'Message manquant.'});
+  if (!OPENAI_KEY) return res.json({ok:false, error:'Clé OpenAI non configurée.'});
+  try {
+    const messages = [
+      {role:'system', content: SYS_PROMPT + '\nTu peux aussi répondre à des questions générales sur la cybersécurité, les réseaux, les protocoles et les bonnes pratiques IT.'},
+      ...history.slice(-10),
+      {role:'user', content: message}
+    ];
+    const res2 = await fetchFn('https://api.openai.com/v1/chat/completions', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':`Bearer ${OPENAI_KEY}`},
+      body:JSON.stringify({model:'gpt-4o', max_tokens:1500, temperature:0.4, messages})
+    });
+    const data = await res2.json();
+    res.json({ok:true, analysis: data.choices[0].message.content});
+  } catch(e) { res.json({ok:false, error:e.message}); }
+});
+
+// IA - Dashboard diagnostic complet
+app.post('/api/ai/diagnostic', async (req, res) => {
+  const {ip, country, isp, asn, ping} = req.body;
+  res.json(await gpt(`Analyse diagnostic réseau complet de la session:
+
+🌍 IP Publique: ${ip}
+📍 Localisation: ${country}
+🏢 FAI/Org: ${isp}
+🔢 ASN: ${asn}
+⚡ Latence serveur: ${ping}ms
+
+Fournis un diagnostic réseau global:
+1. 🔵 Profil réseau (résidentiel, entreprise, datacenter, mobile?)
+2. 🛡️ Évaluation sécurité générale de cette connexion
+3. ⚡ Qualité de connexion basée sur la latence ${ping}ms
+4. 💡 Recommandations générales de sécurité réseau
+5. ⚠️ Risques potentiels pour ce type de connexion
+6. 🚀 Outils complémentaires à utiliser pour auditer ce réseau`));
+});
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🕷  SpiderScann v3.0 — by Anony'x`);
+  console.log(`📡  http://localhost:${PORT}`);
+  console.log(`🤖  GPT-4o: ${OPENAI_KEY ? '✓ OK' : '✗ OPENAI_API_KEY manquant'}`);
+  console.log(`\n📡 Routes réseau: /api/health | /api/hosts | /api/ports | /api/dns | /api/ping | /api/geoip | /api/ssl | /api/whois | /api/blacklist | /api/headers`);
+  console.log(`🧠 Routes IA:     /api/ai/hosts | /api/ai/ports | /api/ai/dns | /api/ai/ssl | /api/ai/ping | /api/ai/whois | /api/ai/geoip | /api/ai/blacklist | /api/ai/headers | /api/ai/cidr | /api/ai/hash | /api/ai/encode | /api/ai/chat | /api/ai/diagnostic\n`);
+});
