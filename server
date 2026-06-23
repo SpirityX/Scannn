@@ -14,7 +14,7 @@ const path       = require('path');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_KEY = process.env.OPENAI_API_KEY || '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';
 
 app.use(cors());
 app.use(express.json());
